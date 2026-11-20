@@ -1,0 +1,154 @@
+import csv
+import math
+from pathlib import Path
+
+import numpy as np
+import rebound
+
+from core_mass_check import sample_log_masses
+
+
+DURATION_YR = 1_000
+DT_YR = 0.25
+GAMMA_PER_YR = 0.0304211
+
+B_MAX_AU = 10_000.0
+BOUNDARY_AU = 15_000.0
+KMS_TO_AU_PER_YR = 365.25 * 86400 / 149_597_870.7
+MAXWELL_SCALE_KMS = 170.0 / math.sqrt(3 - 8 / math.pi)
+
+
+def add_flyby(sim, rng):
+    mass = float(10 ** sample_log_masses(rng, 1)[0])
+    speed_kms = float(np.linalg.norm(rng.normal(0, MAXWELL_SCALE_KMS, 3)))
+    b = B_MAX_AU * math.sqrt(rng.random())
+    inc = math.acos(rng.uniform(-1, 1))
+    node, periapsis = rng.uniform(0, math.tau, 2)
+
+    # Set up a two-body incoming hyperbola relative to the Sun.
+    sun = sim.particles[0]
+    v_inf = speed_kms * KMS_TO_AU_PER_YR
+    abs_a = sim.G * (sun.m + mass) / v_inf**2
+    eccentricity = math.hypot(1, b / abs_a)
+    semilatus_rectum = b**2 / abs_a
+    nominal_q = semilatus_rectum / (1 + eccentricity)
+    cos_f = (semilatus_rectum / BOUNDARY_AU - 1) / eccentricity
+    inbound_f = -math.acos(cos_f)
+
+    sim.add(
+        primary=sun, m=mass, a=-abs_a, e=eccentricity, f=inbound_f,
+        inc=inc, Omega=float(node), omega=float(periapsis),
+    )
+    return (sim.t, mass, speed_kms, b, nominal_q,
+            inc, float(node), float(periapsis))
+
+
+def remove_departed_stars(sim):
+    for index in range(sim.N - 1, 1, -1):
+        sun, star = sim.particles[0], sim.particles[index]
+        dx, dy, dz = star.x - sun.x, star.y - sun.y, star.z - sun.z
+        radius_sq = dx**2 + dy**2 + dz**2
+        radial_motion = (
+            dx * (star.vx - sun.vx)
+            + dy * (star.vy - sun.vy)
+            + dz * (star.vz - sun.vz)
+        )
+        if radius_sq >= BOUNDARY_AU**2 and radial_motion > 0:
+            sim.remove(index)
+
+
+timing_rng = np.random.default_rng(20261117)
+phase_rng = np.random.default_rng(20261118)
+flyby_rng = np.random.default_rng(20261119)
+
+sim = rebound.Simulation()
+sim.units = ("yr", "AU", "Msun")
+sim.integrator = "ias15"
+sim.add(m=1.0)
+
+initial_phase = float(phase_rng.uniform(0, math.tau))
+sim.add(m=5.15e-5, a=30.069, e=0.0086, M=initial_phase)
+sim.move_to_com()
+
+a_initial = sim.particles[1].orbit(primary=sim.particles[0]).a
+events = []
+max_active = 0
+history = [(0.0, 0.0, 0)]  # time, signed delta a/a, active stars
+for step in range(1, round(DURATION_YR / DT_YR) + 1):
+    sim.integrate(step * DT_YR)
+    remove_departed_stars(sim)
+
+    if timing_rng.random() < GAMMA_PER_YR * DT_YR:
+        events.append(add_flyby(sim, flyby_rng))
+
+    max_active = max(max_active, sim.N - 2)
+    a_now = sim.particles[1].orbit(primary=sim.particles[0]).a
+    history.append((sim.t, (a_now - a_initial) / a_initial, sim.N - 2))
+a_final = sim.particles[1].orbit(primary=sim.particles[0]).a
+
+log_path = Path(__file__).resolve().with_name("core_live_flyby_events.csv")
+with log_path.open("w", newline="") as file:
+    writer = csv.writer(file)
+    writer.writerow([
+        "entry_time_yr", "mass_msun", "v_inf_kms", "b_au",
+        "nominal_q_au", "inclination_rad", "node_rad", "periapsis_rad",
+    ])
+    writer.writerows(events)
+
+print(f"Initial Neptune phase: {math.degrees(initial_phase):.2f} deg")
+print(f"Stars added: {len(events)} (expected about {GAMMA_PER_YR * DURATION_YR:.1f})")
+print(f"Most stars present at once: {max_active}")
+print(f"Stars still present at the end: {sim.N - 2}")
+print(f"Neptune delta a/a at year {DURATION_YR}: {a_final / a_initial - 1:+.6e}")
+print(f"Saved {log_path.name}")
+
+import matplotlib.pyplot as plt
+
+times, delta_a, active_stars = np.asarray(history).T
+
+fig, (orbit_ax, stars_ax) = plt.subplots(
+    2, 1, sharex=True, figsize=(9, 5.5), layout="constrained"
+)
+
+orbit_ax.plot(times, delta_a, color="#153c57", lw=1.3)
+orbit_ax.axhline(0, color="0.6", lw=0.8)
+orbit_ax.set(
+    title="Live flyby pilot | Milky Way core",
+    ylabel=r"Neptune's signed $\Delta a/a_0$",
+)
+
+stars_ax.step(times, active_stars, where="post", color="#467c9b")
+stars_ax.set(xlabel="Time (years)", ylabel="Active flyby stars")
+
+if events:
+    closest = min(events, key=lambda event: event[4])
+    print(f"Smallest nominal q: {closest[4]:.2f} AU "
+          f"(star entered at year {closest[0]:.2f})")
+
+plot_path = log_path.with_name("core_live_flyby_pilot.png")
+fig.savefig(plot_path, dpi=200)
+plt.close(fig)
+print(f"Saved {plot_path.name}")
+
+def nominal_periapsis_time(event):
+    entry_year, mass, speed_kms, _, q_au, *_ = event
+    v_inf = speed_kms * KMS_TO_AU_PER_YR
+    abs_a = sim.G * (1.0 + mass) / v_inf**2
+    eccentricity = 1.0 + q_au / abs_a
+    H = math.acosh((1.0 + BOUNDARY_AU / abs_a) / eccentricity)
+    travel_time = abs_a / v_inf * (eccentricity * math.sinh(H) - H)
+    return entry_year + travel_time
+
+
+timed_events = [(nominal_periapsis_time(event), event) for event in events]
+
+for plot_year in (380.0, 925.0):
+    print(f"\nNominal closest approaches nearest year {plot_year:.0f}")
+    candidates = sorted(timed_events, key=lambda item: abs(item[0] - plot_year))
+    for peri_year, event in candidates[:3]:
+        entry_year, mass, speed, _, q_au, *_ = event
+        print(
+            f"  entry={entry_year:.2f} yr, closest approach ~{peri_year:.2f} yr, "
+            f"q={q_au:.1f} AU, mass={mass:.3f} solar masses, "
+            f"speed={speed:.1f} km/s"
+        )
