@@ -1,0 +1,5 @@
+G=39.476926421373001
+initial_phase_rad=2.2600019972935397
+duration_yr=100000
+dt_yr=0.25
+boundary_au=30000
